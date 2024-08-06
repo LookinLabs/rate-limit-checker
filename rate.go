@@ -1,78 +1,122 @@
 package main
 
 import (
-	"flag"
 	"fmt"
-	"io/ioutil"
+	"io"
+	"log"
 	"net/http"
 	"os"
 	"sync"
+
+	"github.com/spf13/cobra"
 )
 
-var threads int
-var method string
-var link string
-var code int
-var cont bool
+var (
+	threads    int
+	method     string
+	link       string
+	statusCode int
+	cont       bool
+	count      int
+	output     string
+	wg         sync.WaitGroup
+	logWriter  io.Writer
+	cmd        = &cobra.Command{
+		Use:   "app",
+		Short: "A brief description of your application",
+		Run:   runLoadTest,
+	}
+)
 
 func main() {
-	var wg sync.WaitGroup
-	var channel = make(chan int)
-	var times int
-	flag.StringVar(&method, "X", "HEAD", "method")
-	flag.IntVar(&threads, "t", 10, "threads")
-	flag.IntVar(&times, "a", 500, "times")
-	flag.BoolVar(&cont, "s", false, "continue after the code changing")
-	flag.StringVar(&link, "u", "", "url")
-	flag.Parse()
+	setupFlags(cmd)
 
+	if err := cmd.Execute(); err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
+}
+
+func setupFlags(cmd *cobra.Command) {
+	cmd.Flags().StringVarP(&method, "method", "X", "GET", "HTTP method to use")
+	cmd.Flags().IntVarP(&threads, "threads", "t", 10, "Number of threads to use")
+	cmd.Flags().IntVarP(&count, "requests-count", "c", 1000, "Number of requests to send")
+	cmd.Flags().BoolVarP(&cont, "ignore-code-change", "i", false, "Continue after the code changing")
+	cmd.Flags().StringVarP(&link, "url", "u", "", "URL to send requests to")
+	cmd.Flags().StringVarP(&output, "output", "o", "", "Output file for logs")
+}
+
+func runLoadTest(cmd *cobra.Command, args []string) {
 	if link == "" {
-		fmt.Println("URL was not provided")
+		log.Fatalf("URL was not provided")
 		return
 	}
 
-	req, _ := http.NewRequest(method, link, nil) //,nil
-	req.Header.Add("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_13_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/77.0.3865.120 Safari/537.36")
-	resp, err := (*http.Client).Do(&http.Client{}, req)
-	if err == nil {
-		code = resp.StatusCode
+	if output != "" {
+		file, err := os.Create(output)
+		if err != nil {
+			log.Fatalf("Failed to create log file: %s\n", err.Error())
+		}
+		defer file.Close()
+		logWriter = file
 	} else {
-		fmt.Println(err.Error())
+		logWriter = os.Stdout
 	}
 
-	for t := 0; t < threads; t++ {
+	// Use sendRequest for the initial request
+	initialRequest, err := sendRequest(method, link, 0)
+	if err != nil {
+		fmt.Fprintf(logWriter, "URL is not available: %s\n", err.Error())
+		return
+	}
+	statusCode = initialRequest.StatusCode
+	fmt.Fprintf(logWriter, "Initial request status code: %d\n", statusCode)
+
+	var channel = make(chan int, count)
+	for threadCount := 0; threadCount < threads; threadCount++ {
 		go func() {
-			for {
-				i := <-channel
-				wg.Add(1)
-				request(i)
+			for requestCount := range channel {
+				sendRequest(method, link, requestCount)
 				wg.Done()
 			}
 		}()
 	}
-	for i := 0; i < times; i++ {
-		channel <- i
+
+	for requestCount := 0; requestCount < count; requestCount++ {
+		wg.Add(1)
+		channel <- requestCount
 	}
+
+	close(channel)
 	wg.Wait()
 }
 
-func request(i int) {
+func sendRequest(method, link string, requestCount int) (*http.Response, error) {
 	client := &http.Client{}
-	req, _ := http.NewRequest(method, link, nil)
-	req.Header.Add("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_13_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/77.0.3865.120 Safari/537.36")
-	resp, err := client.Do(req)
+	request, _ := http.NewRequest(method, link, nil)
+	request.Header.Add("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_13_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/77.0.3865.120 Safari/537.36")
+	response, err := client.Do(request)
 	if err != nil {
-		println(err.Error())
-		return
+		fmt.Fprintln(logWriter, err.Error())
+		return nil, err
 	}
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		println(err.Error())
-	}
-	resp.Body.Close()
+	defer response.Body.Close()
 
-	fmt.Println(i, resp.StatusCode, len(body))
-	if code != resp.StatusCode && !cont {
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		fmt.Fprintln(logWriter, err.Error())
+		return nil, err
+	}
+
+	fmt.Fprintf(logWriter, "Request %d: status code %d, body length %d\n", requestCount, response.StatusCode, len(body))
+	if requestCount == 0 {
+		statusCode = response.StatusCode
+	}
+
+	if statusCode != response.StatusCode && !cont {
+		fmt.Fprintf(logWriter, "Status code mismatch: expected %d, got %d\n", statusCode, response.StatusCode)
 		os.Exit(5)
 	}
+
+	return response, nil
 }
